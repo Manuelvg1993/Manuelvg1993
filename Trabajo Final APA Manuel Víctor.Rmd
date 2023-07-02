@@ -1,0 +1,963 @@
+---
+title: "Analítica Predictiva Avanzada"
+subtitle: "60 series temporales"
+authors: "Manuel Víctor García-Minguillán"
+date: "2022-31-12"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+  word_document:
+    toc: yes
+    toc_depth: '5'
+always_allow_html: yes
+---
+
+```{r, include=FALSE}
+rm(list = ls())
+```
+
+# Introducción
+
+A partir de los tres conjuntos de datos suministrados que están compuestos por 20 series temporales con una frecuencia anual, trimestral y mensual se pretende realizar predicciones hacia delante, las cuales serán evaluadas por el profesor para determinar como de adecuadas son. 
+
+## Objetivo:
+
+El objetivo es realizar de la forma más precisa posible predicciones hacia delante en las series temporales suministradas. Se va a seleccionar el mejor modelo para cada serie a partir de la métrica error seleccionada.
+
+## Librerías:
+
+Se va a emplear la librería suministrada durante el curso (MUMADE), la cual permite utilizar funciones para evaluar y predecir series temporales, además se van a emplear otras para poder paralelizar los procesos  para reducir tiempos y bibliotecas para facilitar el trabajo con los datos y los gráficos.
+
+```{r warning=FALSE}
+library(MUMADE)
+library(ggplot2)
+library(parallel)
+library(parallelsugar)
+library(dplyr)
+library(patchwork)
+```
+
+## Datos:
+
+```{r, warning=FALSE}
+load("seriesCompeticion.Rdat")
+```
+
+```{r, warning=FALSE}
+autoplot(yAnual) +  labs(title='Series Anuales:')
+```
+
+```{r, warning=FALSE}
+autoplot(yTrimestral) + labs(title='Series Trimestrales:')
+```
+
+```{r, warning=FALSE}
+autoplot(yMensual) + labs(title='Series Mensuales:')
+```
+
+Con un análisis visual se puede determinar que existen cambios de estructura en algunas series temporales entorno al año 2000, durante el proceso de predicción se intentará trabajar con este suceso y determinar si las predicciones tendrán que tener en cuenta toda la serie o a partir de este año.
+
+# Trabajo:
+
+## Funciones realizadas:
+
+Durante el desarrollo del trabajo se determinó que la forma más óptima de afrontar el problema es a partir de 4 que faciliten y automaticen el trabajo.
+
+### ForecastMethods:
+
+La primera función es la ampliación de la suministrada por el profesor. En un primer momento esta función predecía 6 modelos, Naive, Snaive, media anual, ETS, PTS y la media y la mediana de una combinación de los modelos Snaive, media anual, ETS y PTS. Se ha realizado una ampliación hasta alcanzar los 17 modelos. Se han aplicado variantes a los modelos ETS y PTS además de introducir 3 pares de combinaciones extras a la ya existente.  El inconveniente de realizar tantos modelos distintos son los tiempos de ejecución a la hora de hacer las predicciones.
+
+Los métodos de la función "forecastMethods" son:
+- 1. Naive
+- 2. Snaive
+- 3. media anual
+- 4. Ets
+- 5. Ets con bootstrap:
+- 6. Ets log
+- 7. Ets bootstrap log:
+- 8. Pts
+- 9. Pts aplicando logaritmos:
+- 10. media normal: media de los metodos snaive, mediaAnual, ETS y PTS
+- 11. mediana normal: mediana de los métodos snaive, mediaAnual, ETS y PTS
+
+
+```{r, warning=FALSE, forecastMethods}
+# Función que predice todos los modelos sobre una serie
+forecastMethods = function(x, h = 4){
+    # Función que devuelve predicciones de todos los métodos en columnas
+    # Algunos ajustes dependiendo de si la entrada es una serie
+    if (is.ts(x)){
+        m = frequency(x)
+    } else {
+        m = h
+    }
+    # Número de años de predicción
+    nYears = ceiling(h / m)
+    # Prediciendo modelos
+    naive = rep(tail(x, 1), h) #(1)
+    snaive = rep(tail(x, m), nYears)[1 : h] #(2)
+    mediaAnual = rep(mean(tail(x, m)), h) #(3) 
+    pETS = ETS(x, h = h)$yFor #(4)
+    pETSb = ETS(x, h = h, bootstrap = T)$yFor #(5)
+    pETSl = exp(ETS(log(x), h = h)$yFor) #(6)
+    pETSlb = exp(ETS(log(x), h = h, bootstrap = T)$yFor) #(7)
+    pPTS = PTS(x, h = h)$yFor #(8)
+    pPTSl = exp(PTS(log(x), h = h)$yFor) #(9)
+    #Modelos
+    pred = cbind(snaive, mediaAnual, pETS, pPTS)  
+    pred_log = cbind(snaive, mediaAnual, pETSl, pPTSl) 
+    pred_b = cbind(snaive, mediaAnual, pETSb, pPTS)
+    pred_blog = cbind(snaive, mediaAnual, pETSlb, pPTSl)
+    # Combinación de modelos
+    media_normal = rowMeans(pred) #(10)
+    mediana_normal = rowMedians(pred) #(11)
+
+    # Todos los modelos en una matriz
+    predicciones = cbind(naive, snaive, mediaAnual, 
+                         pETS, pETSb,
+                         pETSl,
+                         pETSlb, 
+                         pPTS, pPTSl, 
+                         media_normal, mediana_normal)
+    # Nombres de columnas
+    colnames(predicciones) = c("naive", "snaive", "mediaAnual", 
+                               "ETS", "ETSb",
+                               "ETSl", 
+                               "ETSlb", 
+                               "PTS","PTSlog",
+                               "media_normal", "mediana_normal")
+    return(predicciones)
+}
+```
+
+### Error SMape:
+
+La segunda función planteada es para el cálculo del error SMape. El profesor suministro una función con la que se podía calcular el error MASE, pero el criterio de corrección iba a ser con el SMape, por tanto, se va a emplear esta nueva función para determinar cuál es el mejor modelo en cada caso.
+
+```{r, warning=FALSE}
+sMAPE = function(px, actual){
+    n = length(actual)
+    h = length(px)
+    tx = actual[(n - h + 1) : n]
+    error1 = sum(abs(actual[13 : (n - h)] - actual[1 : (n - h - 12)])) / (n - 1)
+    return(200 * cumsum(abs(px - tx) / (abs(px) + abs(tx))) / (1:h)) # Le faltaba el (1:h)
+}
+```
+
+### Bucle_best_3:
+
+La tercera función nace de con la finalidad de determinar a partir de los errores suministrados por las funciones 'slide()' y 'plotslide()' cual es el modelo de predicción que presenta el menor error. Trabajando con estas salida se observó que daba tantas matrices como modelos para cada una de las series temporales, variando la dimensión de la matriz en función del origen establecido en la función 'slide()'.
+
+Además, se observó como variando el origen no siempre el mismo modelo de predicción era el mejor, para elegir de forma más robusta el modelo más adecuado se va utilizar el criterio que como media entre dos orígenes distintos tenga el menor error. Por esta razón la función creada tiene como las siguientes entradas:
+  - errores_1: corresponde a los errores que salen al guardar en un objeto la salida de 'plotslide()'.
+  - errores_2: sirve si se quiere hacer comparaciones entre dos series temporales. Como se indicó al principio existe un cambio de estructura en el año 2000 y por tanto es interesante observar si es mejor predecir sin tener en cuenta los años anteriores o no. Por defecto esta inactivo este parámetro
+  - errores_extra_1 y errores_extra_2: estas dos entradas corresponden a si decide utilizarse la media de errores entre dos orígenes distintos.
+  - d: corresponde a la dimensión de la matriz salida. Esta entrada sirve para hacer modificaciones en caso que se produzcan cambios en la función 'forecastMethods()' y sean más o menos los modelos realizados.
+  
+La salida será un array con una o dos filas. Si es una fila nos dirá cuál es el mejor modelo para cada serie, si son dos filas nos aportará la segunda salida información si es conveniente trabajar esa serie temporal con la reducción de años o no (1=no y 2=sí).
+
+
+```{r, warning=FALSE}
+#Bucle best modelo
+bucle_best_3 = function(errores_1, errores_2=NA, error_extra_1=NA, error_extra_2=NA, d=c(1,11,20)){
+  # solo sirve para series con 20 series, da error raro de media -> línea futura de resolver
+  #El criterio de entradas va a ser el origen más pequeño siempre como error 1 o 2, y el de origen más grande como extra 1 y 2 por defecto
+  list_bestA =array()
+  best_serie =array()
+  #Función 1
+  if ((class(errores_1)==class(errores_2))==F) {
+  errores_medios = array( dim = d)
+    for (i in 1:20) {
+        for (j in 1:11) {
+          if ((class(errores_1)==class(error_extra_1))==F) {
+            errores_medios[1,j,i] = mean(errores_1[,,j,i], na.rm=T)
+          }else{
+            errores_medios[1,j,i] = (mean(errores_1[,,j,i], na.rm=T) + mean(error_extra_1[,,j,i], na.rm=T))/2
+          }
+        }
+        list_bestA[i]= which(errores_medios[,,i] == min(errores_medios[,,i]), arr.ind = TRUE)
+    }
+  return(list_bestA)
+  #Función 2
+  } else{
+      errores_medios_1 = array( dim = d)
+      errores_medios_2 = array( dim = d)
+      best_model =array()
+      for (i in 1:20) {
+        for (j in 1:11) {
+          if ((class(errores_1)==class(error_extra_1))==F) {
+            if ((class(errores_2)==class(error_extra_2))==F) {
+              errores_medios_1[1,j,i] = mean(errores_1[,,j,i], na.rm=T )
+              errores_medios_2[1,j,i] = mean(errores_2[,,j,i], na.rm=T)
+            }else{
+              errores_medios_1[1,j,i] = mean(errores_1[,,j,i], na.rm=T)
+              errores_medios_2[1,j,i] = (mean(errores_2[,,j,i], na.rm=T) + mean(error_extra_2[,,j,i], na.rm=T))/2
+            }
+          } else{
+            if ((class(errores_2)==class(error_extra_2))==F) {
+              errores_medios_1[1,j,i] = (mean(errores_1[,,j,i], na.rm=T) + mean(error_extra_1[,,j,i], na.rm=T))/2
+              errores_medios_2[1,j,i] = mean(errores_2[,,j,i], na.rm=T)
+            } else{
+              errores_medios_1[1,j,i] = (mean(errores_1[,,j,i], na.rm=T) + mean(error_extra_1[,,j,i], na.rm=T))/2
+              errores_medios_2[1,j,i] = (mean(errores_2[,,j,i], na.rm=T) + mean(error_extra_2[,,j,i], na.rm=T))/2
+            }
+          }
+        }
+        if (min(errores_medios_1[,,i])<min(errores_medios_2[,,i])) {
+          list_bestA[i]= which(errores_medios_1[,,i] == min(errores_medios_1[,,i]), arr.ind = TRUE)
+          best_serie[i] = 1
+        } else{
+          list_bestA[i]= which(errores_medios_2[,,i] == min(errores_medios_2[,,i]), arr.ind = TRUE)
+          best_serie[i]=2
+        }
+      }
+      
+      salida = rbind(list_bestA,best_serie)
+      rownames(salida) = c("modelo","serie")
+      return(salida)
+      #return(errores_medios_1)
+      }
+}
+```
+
+### FullMethods:
+
+Esta tercera función se utiliza con la salida provistas por la función 'bucle_best_3()' y la serie original, provee las predicciones hacia delante de las series temporales a partir del modelo que haya presentado un menor error y teniendo en cuenta el cambio de estructura. Las entradas son:
+  - series: series originales.
+  - modelos: se indica el objeto donde se está recogido cual es el mejor modelo para cada serie. Si la salida de la función anterior es un array con 2 filas, será: 'salida[,1]' en caso que solo sea una fila se introducirá directamente la salida anterior
+  - tipo_serie: sirve para indicar que series deben sufrir una reducción de años, para ello hay que introducir la segunda fila de la salida anterior 'salida[,2]'. Por defecto está indicado que no se hagan modificaciones.
+  - año_ventana: en caso de que haya que hacer reducción de años en las series temporales hay que indicar que año es el de comienzo de la serie. Por defecto está determinado que sea el año de origen de la serie para que no produzca errores.
+  - h: son los pasos hacia delante para predecir. 
+
+```{r, warning=FALSE}
+fullMethods = function(series, modelos, tipo_serie=rep(1, ncol(series)) , año_venta = start(series)[1], h=6){
+  #Parámetros
+  m=frequency(series)
+  n=length(series)/nrow(series)
+  predicciones = ts(matrix(NA, h, 20), frequency = m, start = tail(time(series), 1) + 1 / m)
+  serie_reducida =  window(series, start=año_venta)
+  
+  for (i in 1:n) {
+    if (tipo_serie[i]==1) {
+      #Naive (1)
+      if (modelos[i]==1) {
+        predicciones[,i] = rep(tail(series[,i], 1), h)
+      } #SNaive (2)
+      if (modelos[i]==2) {
+        predicciones[,i]= rep(tail(series[,i], m), h)[1 : h]
+      } #Media Anual (3)
+      if (modelos[i]==3) {
+        predicciones[, i] = rep(mean(tail(series[,i], m)), h)
+      } #ETS (4)
+      if (modelos[i]==4) {
+        predicciones[, i] = ETS(series[,i], h=h)$yFor
+      } #ETSb (5)
+      if (modelos[i]==5) {
+        predicciones[, i] = ETS(series[,i], h=h, bootstrap = T)$yFor
+      } #ETSl (6)
+      if (modelos[i]==6) {
+        predicciones[, i] =  exp(ETS(log(series[,i]), h=h)$yFor)
+      } #ETSlb (7)
+      if (modelos[i]==7) {
+        predicciones[, i] =  exp(ETS(log(series[,i]), h=h, bootstrap = T)$yFor)
+      }  #PTS (8)
+      if (modelos[i]==8) {
+        predicciones[, i] = PTS(series[,i], h=h)$yFor
+      } #PTS log (9)
+      if (modelos[i]==9) {
+        predicciones[, i] = exp(PTS(log(series[,i]), h = h)$yFor)
+      } #Media norm (10)
+      if (modelos[i]==10) {
+        temporal1 = rep(tail(series[,i], m), h)[1 : h]
+        temporal2 = rep(mean(tail(series[,i], m)), h)
+        temporal3 = ETS(series[,i], h=h)$yFor
+        temporal4 = PTS(series[,i], h=h)$yFor
+        pred = cbind(temporal1, temporal2, temporal3, temporal4)
+        predicciones[, i] =  rowMeans(pred)
+      } #Mediana norm (11)
+      if (modelos[i]==11) {
+        temporal1 = rep(tail(series[,i], m), h)[1 : h]
+        temporal2 = rep(mean(tail(series[,i], m)), h)
+        temporal3 = ETS(series[,i], h=h)$yFor
+        temporal4 = PTS(series[,i], h=h)$yFor
+        pred = cbind(temporal1, temporal2, temporal3, temporal4)
+        predicciones[, i] =  rowMedians(pred)
+      } 
+    }else{
+      #Naive (1)
+      if (modelos[i]==1) {
+        predicciones[,i] = rep(tail(serie_reducida[,i], 1), h)      
+      } #SNaive (2)
+      if (modelos[i]==2) {
+        predicciones[,i]= rep(tail(serie_reducida[,i], m), h)[1 : h]
+      } #Media Anual (3)
+      if (modelos[i]==3) {
+        predicciones[, i] = rep(mean(tail(serie_reducida[,i], m)), h)
+      } #ETS (4)
+      if (modelos[i]==4) {
+        predicciones[, i] = ETS(serie_reducida[,i], h=h)$yFor
+      } #ETSb (5)
+      if (modelos[i]==5) {
+        predicciones[, i] = ETS(serie_reducida[,i], h=h, bootstrap = T)$yFor
+      }#ETSl (6)
+      if (modelos[i]==6) {
+        predicciones[, i] =  exp(ETS(log(serie_reducida[,i]), h=h)$yFor)
+      } #ETSlb (7)
+      if (modelos[i]==7) {
+        predicciones[, i] =  exp(ETS(log(serie_reducida[,i]), h=h, bootstrap = T)$yFor)
+      } #PTS (8)
+      if (modelos[i]==8) {
+        predicciones[, i] = PTS(serie_reducida[,i], h=h)$yFor
+      } #PTS log (9)
+      if (modelos[i]==9) {
+        predicciones[, i] = exp(PTS(log(serie_reducida[,i]), h = h)$yFor)
+      } #Media norm (10)
+      if (modelos[i]==10) {
+        temporal1 = rep(tail(serie_reducida[,i], m), h)[1 : h]
+        temporal2 = rep(mean(tail(serie_reducida[,i], m)), h)
+        temporal3 = ETS(serie_reducida[,i], h=h)$yFor
+        temporal4 = PTS(serie_reducida[,i], h=h)$yFor
+        pred = cbind(temporal1, temporal2, temporal3, temporal4)
+        predicciones[, i] =  rowMeans(pred)
+      } #Mediana norm (11)
+      if (modelos[i]==11) {
+        temporal1 = rep(tail(serie_reducida[,i], m), h)[1 : h]
+        temporal2 = rep(mean(tail(serie_reducida[,i], m)), h)
+        temporal3 = ETS(serie_reducida[,i], h=h)$yFor
+        temporal4 = PTS(serie_reducida[,i], h=h)$yFor
+        pred = cbind(temporal1, temporal2, temporal3, temporal4)
+        predicciones[, i] =  rowMedians(pred)        
+      } 
+  }
+  }
+  return(predicciones)
+  }
+```
+
+## Funciones extras:
+
+### bucle_best_3_mod
+Modificación de salida de la función anterior para hacer una comparación más profunda con ventanas fijas y móviles.
+
+```{r}
+bucle_best_3_mod = function(errores_1, errores_2=NA, error_extra_1=NA, error_extra_2=NA, d=c(1,11,20)){
+  # solo sirve para series con 20 series, da error raro de media -> linea futura de resolver
+  #El criterio de entradas va a ser el origen más pequeño siempre como error 1 o 2, y el de origen más grande como extra 1 y 2 por defecto
+  list_bestA =array()
+  best_serie =array()
+  #Función 1
+  if ((class(errores_1)==class(errores_2))==F) {
+  errores_medios = array( dim = d)
+    for (i in 1:20) {
+        for (j in 1:11) {
+          if ((class(errores_1)==class(error_extra_1))==F) {
+            errores_medios[1,j,i] = mean(errores_1[,,j,i], na.rm=T)
+          }else{
+            errores_medios[1,j,i] = (mean(errores_1[,,j,i], na.rm=T) + mean(error_extra_1[,,j,i], na.rm=T))/2
+          }
+        }
+        list_bestA[i]= which(errores_medios[,,i] == min(errores_medios[,,i]), arr.ind = TRUE)
+    }
+  return(errores_medios)
+  #Función 2
+  } else{
+      errores_medios_1 = array( dim = d)
+      errores_medios_2 = array( dim = d)
+      best_model =array()
+      for (i in 1:20) {
+        for (j in 1:11) {
+          if ((class(errores_1)==class(error_extra_1))==F) {
+            if ((class(errores_2)==class(error_extra_2))==F) {
+              errores_medios_1[1,j,i] = mean(errores_1[,,j,i], na.rm=T )
+              errores_medios_2[1,j,i] = mean(errores_2[,,j,i], na.rm=T)
+            }else{
+              errores_medios_1[1,j,i] = mean(errores_1[,,j,i], na.rm=T)
+              errores_medios_2[1,j,i] = (mean(errores_2[,,j,i], na.rm=T) + mean(error_extra_2[,,j,i], na.rm=T))/2
+            }
+          } else{
+            if ((class(errores_2)==class(error_extra_2))==F) {
+              errores_medios_1[1,j,i] = (mean(errores_1[,,j,i], na.rm=T) + mean(error_extra_1[,,j,i], na.rm=T))/2
+              errores_medios_2[1,j,i] = mean(errores_2[,,j,i], na.rm=T)
+            } else{
+              errores_medios_1[1,j,i] = (mean(errores_1[,,j,i], na.rm=T) + mean(error_extra_1[,,j,i], na.rm=T))/2
+              errores_medios_2[1,j,i] = (mean(errores_2[,,j,i], na.rm=T) + mean(error_extra_2[,,j,i], na.rm=T))/2
+            }
+          }
+        }
+        if (min(errores_medios_1[,,i])<min(errores_medios_2[,,i])) {
+          list_bestA[i]= which(errores_medios_1[,,i] == min(errores_medios_1[,,i]), arr.ind = TRUE)
+          best_serie[i] = 1
+        } else{
+          list_bestA[i]= which(errores_medios_2[,,i] == min(errores_medios_2[,,i]), arr.ind = TRUE)
+          best_serie[i]=2
+        }
+      }
+      
+      salida = rbind(list_bestA,best_serie)
+      rownames(salida) = c("modelo","serie")
+      return(salida)
+      #return(errores_medios_1)
+      }
+    
+}
+```
+
+
+### combinacion_errores
+Función para comparar diferentes métodos y determinar posteriormente con un bucle cual el el método que saca el menor error. 
+
+```{r}
+combinacion_errores <- function(errores_1a, errores_2a=NA, errores_3a=NA,errores_4a=NA,error_extra_1a=NA, error_extra_2a=NA, error_extra_3a=NA,error_extra_4a=NA,d=c(1,11,20)) {
+
+  errores_medios_extra1 = bucle_best_3_mod(errores_1 = errores_1a, error_extra_1 =error_extra_1a)
+  
+  if (class(errores_2a) == "array") {
+    errores_medios_extra2 = bucle_best_3_mod(errores_1 = errores_2a, error_extra_1 =error_extra_2a)
+      
+    if (class(errores_3a) == "array") {
+        errores_medios_extra3 = bucle_best_3_mod(errores_1 = errores_3a, error_extra_1 =error_extra_3a)
+          
+        if (class(errores_4a) == "array") {
+            errores_medios_extra4 = bucle_best_3_mod(errores_1 = errores_4a, error_extra_1 =error_extra_4a)
+            salida = array(NA,dim = c(1,11,20,4))
+            salida[,,,1] = errores_medios_extra1
+            salida[,,,2] = errores_medios_extra2
+            salida[,,,3] = errores_medios_extra3
+            salida[,,,4] = errores_medios_extra4
+            return(salida)
+            
+        } 
+        else{
+          salida = array(NA,dim = c(1,11,20,3))
+          salida[,,,1] = errores_medios_extra1
+          salida[,,,2] = errores_medios_extra2
+          salida[,,,3] = errores_medios_extra3
+          return(salida)
+            }
+        
+    }
+    else{
+      salida = array(NA,dim = c(1,11,20,2))
+      salida[,,,1] = errores_medios_extra1
+      salida[,,,2] = errores_medios_extra2
+      return(salida)
+    }
+  } else{
+    salida = array(NA,dim = c(1,11,20,1))
+    salida[,,,1] = errores_medios_extra1
+    return(salida)
+  }
+  }
+
+
+
+```
+
+# Predicciones 
+
+## Anual:
+
+- Predicciones dentro de la muestra:
+Cálculo de predicciones para la serie anual con distintas ventanas de origen (16 y 20), y predicción para la serie anual a partir del año 2000. los orígenes se han establecido en 16 el más pequeño debido que era el que producía el mayor número de predicciones (9), el origen 20 se estableció de forma genérica y produce 5 predicciones. Se ha establecido en 12 el origen en la predicción de la serie acotada debido que ningún otro valor nos generaba resultados.
+
+```{r, warning=FALSE}
+yAnual_2000 =window(yAnual, start=2000)
+
+outA_o16 = slide(yAnual, 16, forecastMethods, h= 6, parallel = T)
+outA_o20 = slide(yAnual, 20, forecastMethods, h= 6, parallel = T)
+outA_2000 = slide(yAnual_2000, 12, forecastMethods, h= 6, parallel = T)
+```
+
+- Mejor modelo general con orig=16:
+Con este tipo de gráficos nos aporta información general de cuál sería el mejor modelo que predice las 20 series. Como el objetivo se estableció en utilizar el mejor modelo para cada serie se guardará las matrices obtenidas y será la entrada de las funciones creadas para obtener el menor error. Además, se generará objetos con un origen situado en 20 y con la serie acotada a partir del año 2000.
+
+```{r, warning=FALSE, fig.width=8}
+bestA_o16=plotSlide(outA_o16, yAnual,16, 1, errorFun = sMAPE)
+```
+
+- Mejor modelo general con orig=20:
+```{r, warning=FALSE, fig.width=8}
+bestA_o20=plotSlide(outA_o20, yAnual,20, 1, errorFun = sMAPE)
+```
+
+
+- Mejor modelo general serie 2000 con orig=12:
+
+```{r, warning=FALSE, fig.width=8}
+bestA_2000=plotSlide(outA_2000, yAnual_2000,12, 1, errorFun = sMAPE) #En este caso no se puede poner otro valor en en orig al ser tan pocos años
+```
+
+
+- Cálculo del mejor modelo para cada serie temporal de forma individual 
+Con la función creada se obtiene cual ha sido el modelo que ha presentado un menor error y si es conveniente acotar la serie temporal. 
+
+```{r, warning=FALSE}
+best_anual = bucle_best_3(errores_1 = bestA_o16, error_extra_1 = bestA_o20, errores_2 =  bestA_2000)
+best_anual
+```
+
+```{r}
+modelosA = data.frame(modelos = best_anual[1,])
+modelosA = modelosA |> group_by(modelos) |> summarize(veces_usado = length(modelos))
+modelosA |> arrange(desc(veces_usado))
+```
+
+
+- Predicciones fuera de la muestra:
+```{r, warning=FALSE}
+predict_anual = fullMethods(series =yAnual, modelos = best_anual[1,], tipo_serie=best_anual[2,], año_venta = 2000)
+fAnual = predict_anual
+```
+
+
+Visualmente las predicciones generadas presentan cierta coherencia con la tendencia histórica que han tenido. Algunas series como la 6 presenta unos valores futuros muy planos debido al cambio reciente de tendencia. El resto de series parecen guardar bastante bien una coherencia entre valores y predicción.
+
+```{r, warning=FALSE, fig.height=8, fig.width=8}
+A1 = (autoplot(yAnual[,(1:5)]) + autolayer(predict_anual[,(1:5)])) + labs(title='Series Mensuales 1-5:')
+A2 = (autoplot(yAnual[,(6:10)]) + autolayer(predict_anual[,(6:10)])) + labs(title='Series Mensuales 6-10:')
+A3 = (autoplot(yAnual[,(10:15)]) + autolayer(predict_anual[,(10:15)])) + labs(title='Series Mensuales 11-15:')
+A4 = (autoplot(yAnual[,(16:10)]) + autolayer(predict_anual[,(16:10)])) + labs(title='Series Mensuales 16-20:')
+A1 / A2 / A3 / A4
+```
+
+
+### Proceso con ventana fijas
+
+```{r, warning=FALSE}
+yAnual_2000_vf =window(yAnual, start=2000)
+
+outA_o16_vf = slide(yAnual, 16, forecastMethods, h= 6, parallel = T, window = 12)
+outA_o20_vf = slide(yAnual, 20, forecastMethods, h= 6, parallel = T, window = 12)
+outA_2000_vf = slide(yAnual_2000_vf, 12, forecastMethods, h= 6, parallel = T, window = 6)
+```
+
+```{r}
+bestA_o16_vf=plotSlide(outA_o16_vf, yAnual,16, 1, errorFun = sMAPE) 
+bestA_o20_vf=plotSlide(outA_o20_vf, yAnual,20, 1, errorFun = sMAPE)
+bestA_2000_vf=plotSlide(outA_2000_vf, yAnual_2000,12, 1, errorFun = sMAPE)
+```
+
+```{r, warning=FALSE}
+best_anual_vf = bucle_best_3(errores_1 = bestA_o16_vf, error_extra_1 = bestA_o20_vf, errores_2 =  bestA_2000_vf)
+```
+
+
+```{r, warning=FALSE}
+best_anual_vf
+```
+
+#### Comparaciones
+
+```{r, warning=FALSE}
+best_anual_comparacion_1 = bucle_best_3(errores_1 = bestA_o16, error_extra_1 = bestA_o20, errores_2 =  bestA_o16_vf, error_extra_2 =bestA_o20_vf )
+best_anual_comparacion_2 = bucle_best_3(errores_1 = bestA_2000, errores_2 =  bestA_2000_vf )
+```
+
+
+Extra: 
+
+```{r, warning=FALSE}
+best_anual
+best_anual_vf
+best_anual_comparacion_1
+best_anual_comparacion_2
+```
+
+Se han hecho todas las comparaciones posibles, para poder aproximar de mejor forma el modelo habría que tener en cuenta en la función 'bucle_best_3()' todos estos escenarios para determinar el mejor modelo de predicción. La finalidad de esa función es determinar principalmente si utilizar una serie acotada o no para predecir y poder predecir. En principio se seguirá el método de ventanas fijas para predecir ya es el método original con el que se ha diseñado todo el estudio.
+
+Extra 2: 
+Bucle para saber como el el método que mejor predice y el método que mejor predice.
+
+
+```{r, warning=FALSE}
+prueba = combinacion_errores(errores_1a=bestA_o16, error_extra_1a=bestA_o20, errores_2a = bestA_2000, errores_3a = bestA_o16_vf, error_extra_3a = bestA_o20_vf, errores_4a = bestA_2000_vf )
+list_bestA =array()
+best_serie =array()
+
+for (i in 1:20) {
+  if (min(prueba[,,i,1])<min(prueba[,,i,2])) {
+    if (min(prueba[,,i,1])<min(prueba[,,i,3])) {
+      if (min(prueba[,,i,1])<min(prueba[,,i,4])) {
+        list_bestA[i]= which(prueba[,,i,1] == min(prueba[,,i,1]), arr.ind = TRUE)
+        best_serie[i] = 1
+      }else
+        list_bestA[i]= which(prueba[,,i,4] == min(prueba[,,i,4]), arr.ind = TRUE)
+        best_serie[i] = 4
+    }else{
+      if (min(prueba[,,i,3])<min(prueba[,,i,4])) {
+        list_bestA[i]= which(prueba[,,i,3] == min(prueba[,,i,3]), arr.ind = TRUE)
+        best_serie[i] = 3
+      } else{
+        list_bestA[i]= which(prueba[,,i,4] == min(prueba[,,i,4]), arr.ind = TRUE)
+        best_serie[i] = 4
+      }
+    }
+
+    } else{
+      if (min(prueba[,,i,2])<min(prueba[,,i,3])) {
+        if (min(prueba[,,i,2])<min(prueba[,,i,4])) {
+          list_bestA[i]= which(prueba[,,i,2] == min(prueba[,,i,2]), arr.ind = TRUE)
+          best_serie[i] = 2
+        } else{
+          list_bestA[i]= which(prueba[,,i,4] == min(prueba[,,i,4]), arr.ind = TRUE)
+          best_serie[i] = 4
+        }
+      } else{
+          if (min(prueba[,,i,3])<min(prueba[,,i,4])) {
+        list_bestA[i]= which(prueba[,,i,3] == min(prueba[,,i,3]), arr.ind = TRUE)
+        best_serie[i] = 3
+      } else{
+        list_bestA[i]= which(prueba[,,i,4] == min(prueba[,,i,4]), arr.ind = TRUE)
+        best_serie[i] = 4
+      }
+    }
+    }
+  salida = rbind(list_bestA,best_serie)
+}
+```
+
+
+```{r, warning=FALSE}
+salida
+```
+
+## Trimestral:
+
+- Predicciones dentro de la muestra:
+Cálculo de predicciones para la serie trimestral con distintas ventanas de origen (16x4 y 20x4), y predicción para la serie acotada será a partir del año 2000 con orígenes 6x12 y 6x4 debido a que se han reducido los años de la muestra.
+
+
+```{r, warning=FALSE}
+yTrimestral_2000 =window(yTrimestral, start=2000)
+
+outT_o16 = slide(yTrimestral, 16*4, forecastMethods, h= 8, parallel = T)
+outT_o20 = slide(yTrimestral, 20*4, forecastMethods, h= 8, parallel = T)
+outT_2000 = slide(yTrimestral_2000, 12*4, forecastMethods, h= 8, parallel = T)
+outT_2000_2 = slide(yTrimestral_2000, 6*4, forecastMethods, h= 8, parallel = T)
+```
+
+- Mejor modelo general con orig=16*4:
+```{r, warning=FALSE, fig.width=8}
+bestT_o16=plotSlide(outT_o16, yTrimestral,16*4, 1, errorFun = sMAPE)
+```
+
+- Mejor modelo general con orig=20*4:
+```{r, warning=FALSE, fig.width=8}
+bestT_o20=plotSlide(outT_o20, yTrimestral,20*4, 1, errorFun = sMAPE)
+```
+
+- Mejor modelo general serie 2000 con orig=12:
+```{r, warning=FALSE, fig.width=8}
+bestT_2000=plotSlide(outT_2000, yTrimestral_2000,12*4, 1, errorFun = sMAPE)
+```
+
+- Mejor modelo general serie 2000 con orig=6:
+```{r, warning=FALSE, fig.width=8}
+bestT_2000_2=plotSlide(outT_2000_2, yTrimestral_2000,6*4, 1, errorFun = sMAPE)
+```
+
+
+- Cálculo del mejor modelo para cada serie temporal de forma individual.
+
+```{r warning=FALSE}
+best_trimestral = bucle_best_3(errores_1 = bestT_o16, error_extra_1 = bestT_o20, errores_2 =  bestT_2000, error_extra_2 = bestT_2000_2)
+best_trimestral
+```
+
+- Predicciones fuera de la muestra:
+```{r, warning=FALSE}
+predict_trimestral = fullMethods(series =yTrimestral, modelos = best_trimestral[1,], tipo_serie=best_trimestral[2,], año_venta = 2000, h=8)
+fTrimestral = predict_trimestral
+```
+
+
+```{r}
+modelosT = data.frame(modelos = best_trimestral[1,])
+modelosT = modelosT |> group_by(modelos) |> summarize(veces_usado = length(modelos))
+modelosT |> arrange(desc(veces_usado))
+```
+
+Como en el caso de las series anuales parece guardar bastante coherencia predicción con los datos históricos.
+
+```{r, warning=FALSE, fig.height=8, fig.width=8}
+T1 = (autoplot(yTrimestral[,1:5]) + autolayer(predict_trimestral[,1:5])) + labs(title='Series Trimestral 1-5:')
+T2 = (autoplot(yTrimestral[,6:10]) + autolayer(predict_trimestral[,6:10])) + labs(title='Series Trimestral 6-10:')
+T3 = (autoplot(yTrimestral[,10:15]) + autolayer(predict_trimestral[,10:15])) + labs(title='Series Trimestral 11-15:')
+T4 = (autoplot(yTrimestral[,16:10]) + autolayer(predict_trimestral[,16:10])) + labs(title='Series Trimestral 16-20:')
+ 
+T1 / T2 / T3 / T4
+```
+
+## Mensual
+
+- Predicciones dentro de la muestra:
+Cálculo de predicciones para la serie mensual con distintas ventanas de origen (16 y 20), además en este caso no se acotará la serie a partir del año 2000 debido que no parecía existir un cambio de estructura en los gráficos iniciales.
+
+```{r, warning=FALSE}
+outm_o12=slide(yMensual, 12*12, forecastMethods, h=18, parallel = T) # sin parallel = 16min15s, con parallel = 3min8s
+outm_o6=slide(yMensual, 6*12, forecastMethods, h=18, parallel = T)
+
+```
+
+- Mejor modelo general con orig=12*12:
+```{r, warning=FALSE, fig.width=8}
+bestM_o12=plotSlide(outm_o12, yMensual,12*12, 1, errorFun = sMAPE)
+```
+
+- Mejor modelo general con orig=6*12:
+```{r, warning=FALSE, fig.width=8}
+bestM_o6=plotSlide(outm_o6, yMensual,6*12, 1, errorFun = sMAPE)
+```
+
+
+- Cálculo del mejor modelo para cada serie temporal de forma individual:
+
+```{r warning=FALSE}
+best_mensual = bucle_best_3(errores_1 = bestM_o6, error_extra_1 = bestM_o12)
+best_mensual
+```
+
+- Predicciones fuera de la muestra:
+```{r, warning=FALSE}
+predict_mensual = fullMethods(series =yMensual, modelos = best_mensual, h=18)
+fMensual = predict_mensual
+```
+
+
+```{r}
+modelosM = data.frame(modelos = best_mensual)
+modelosM = modelosM |> group_by(modelos) |> summarize(veces_usado = length(modelos))
+modelosM |> arrange(desc(veces_usado))
+```
+
+Manteniendo la tendencia de las series anteriores, la función creada parece funcionar correctamente y replicar bastante bien el comportamiento de la serie y presentar predicciones bastante coherentes.
+
+```{r, warning=FALSE, fig.height=8, fig.width=8}
+M1 = (autoplot(yMensual[,1:5]) + autolayer(predict_mensual[,1:5])) + labs(title='Series Mensual 1-5:')
+M2 = (autoplot(yMensual[,6:10]) + autolayer(predict_mensual[,6:10])) + labs(title='Series Mensual 6-10:')
+M3 = (autoplot(yMensual[,10:15]) + autolayer(predict_mensual[,10:15])) + labs(title='Series Mensual 11-15:')
+M4 = (autoplot(yMensual[,16:20]) + autolayer(predict_mensual[,16:20])) + labs(title='Series Mensual 16-20:')
+ 
+M1 / M2 / M3 / M4
+```
+
+## Mejor modelo predictor
+
+En la siguiente tabla se observa cual es el modelo más utilizado para predecir en función de las características. Si tenemos en cuenta que los modelos 4,5,6 y 7 pertenecen al modelo ETS y los modelos 8 y 9 pertenecen al modelo PTS estos han sido utilizados 33 y 12 veces respectivamente lo que supone que se ha utilizado en el 75% de las series. Los modelos 10 y 11 son combinaciones de los modelos ETS y PTS con la media anual y el SNaive. Hay que destacar que el modelo Naive para predecir se ha empleado un total de 8 veces.
+
+```{r}
+modeloB = rbind(modelosA, modelosT,modelosM)
+modeloB = modeloB |> group_by(modelos) |>  summarise(veces_usado = sum(veces_usado)) |> arrange(desc(veces_usado))
+modeloB
+```
+
+
+
+
+
+# Archivo con predicciones
+
+```{r}
+save(fAnual, fTrimestral, fMensual, file = "prediccionCompeticion.RDat")
+```
+
+# Limitaciones:
+
+1. En el desarrollo del trabajo se han planteado distintos modelos combinatorios a partir de logaritmos en el modelo, pero había casos como es la serie 11 de los datos de frecuencia anual que hacía que se asemejara a un modelo naive si trabajaba con una serie de datos reducida.
+
+```{r}
+serie_reducida=window(yAnual[,11],start=2000)
+
+temporal1 = rep(tail(serie_reducida))[1 : 6]
+temporal2 = rep(mean(tail(serie_reducida)), 6)
+temporal3 = exp(ETS(log(serie_reducida), h=6)$yFor)
+temporal4 = exp(PTS(log(serie_reducida), h = 6)$yFor)
+
+pred = cbind(temporal1, temporal2, temporal3, temporal4)
+predicciones =  rowMeans(pred)
+predicciones = ts(predicciones, start = 2019, frequency = 1)
+
+autoplot(yAnual[,(11)])+autolayer(predicciones)
+```
+
+```{r}
+temporal3
+```
+
+
+```{r}
+temporal4
+```
+
+Por esta razón se va a mantener únicamente el método de combinación original propuesto por el profesor (sNaive, Media anual, ETS, PTS), además se reducirá el tiempo de ejecución de la función 'slide()'. El resto de modelos combinatorios propuestos fueron:
+
+- 12. Media log: media de los métodos snaive, mediaAnual, ETS y PTS log
+- 13. Mediana log: mediana de los métodos snaive, mediaAnual, ETS y PTS log
+- 14. Media bootstrap
+- 15. Mediana bootstrap
+- 16. Media log bootstrap
+- 17. Mediana log bootstrap  
+
+2. Outliers Temporales
+Se ha explorado otras vías para suavizar posibles outliers temporales con la librería 'tseries' y 'tsoutliers' como en la serie 5 de los datos mensuales.
+
+```{r}
+library(tseries)
+```
+```{r}
+par(mfrow=c(1,2))
+plot(yMensual[,5])
+boxplot(yMensual[,5])
+```
+
+
+```{r}
+library(tsoutliers)
+```
+Genera error la función 'tso()' con la serie 5 de los datos mensuales.
+```{r}
+#outliers <- tso(yMensual[,5])
+```
+Un ejemplo para mostrar la salida es:
+
+```{r}
+outliers <- tso(yMensual[,6])
+plot(outliers )
+```
+Pero seria para series muy constantes y por tanto al no saber el origen de los datos, se ha preferido no emplear esta técnica. Se podría utilizar por ejemplo en placas solares donde los resultados están restringidos al rendimiento de las placas solares.
+
+
+
+# Anexo
+
+Las siguientes funciones son la base de las funciones anteriores y cómo ha evolucionado el desarrollo de ser funciones más simples a la elaboración de las cuatro utilizadas en la práctica.
+
+## Error MASE:
+
+```{r}
+# Función que calcula el MASE sobre una predicción para una serie temporal
+MASE = function(px, actual){
+    n = length(actual)
+    h = length(px)
+    tx = actual[(n - h + 1) : n]
+    train = actual[1 : (n - h)]
+    error1 = sum(abs(actual[13 : (n - h)] - actual[1 : (n - h - 12)])) / (n - 1)
+    return(cumsum(abs(px - tx)) / error1 / (1 : h))
+}
+
+```
+
+## Bucle Best
+
+
+```{r}
+#Bucle best modelo
+bucle_best = function(errores, d=c(1,11,20)){
+    errores_medios = array( dim = d)
+    for (i in 1:20) {
+        for (j in 1:11) {
+            errores_medios[1,j,i] = mean(errores[,,j,i])
+        }
+    }
+    
+    list_bestA =array()
+    for (i in 1:20) {
+        list_bestA[i]= which(errores_medios[,,i] == min(errores_medios[,,i]), arr.ind = TRUE)
+    }
+    #return(list_bestA)
+    return(errores_medios)
+}
+```
+
+
+## Comp_error
+
+```{r}
+
+comp_error = function(error_1, error_2){
+  mejor_error = array()
+  l=length(error_1)
+  comp= c_error_1 > c_error_2
+  for (p in 1:l) {
+    if (comp[p]==T) {
+      mejor_error[p] = 1
+      }
+    if(comp[p]==F) {
+      mejor_error[p] = 2
+      }
+    }
+   return(mejor_error)
+}
+
+
+# con esta función se elegirá si el método con todas las observaciones o únicamente con el corte en el 2000
+```
+
+## Bucle best_2
+
+```{r}
+
+#Bucle best modelo
+bucle_best_2 = function(errores_1, errores_2=NA, errores_extra_1=NA, errores_extra_2=NA , d=c(1,17,20)){
+  list_bestA =array()
+  best_serie =array()
+  #Función 1
+  if ((class(bestA_o16)==class(errores_2))==F) {
+  errores_medios = array( dim = d)
+  errores_extra = array( dim = d)
+    for (i in 1:20) {
+      for (j in 1:17) {
+        errores_medios[1,j,i] = mean(errores_1[,,j,i])
+        list_bestA[i]= which(errores_medios[,,i] == min(errores_medios[,,i]), arr.ind = TRUE)
+    
+        }
+    }
+  return(list_bestA)}}
+```
+
+## Bucle best_2.1
+
+```{r}
+#Bucle best modelo
+bucle_best_2_1 = function(errores_1, errores_2=NA , d=c(1,17,20)){
+  list_bestA =array()
+  best_serie =array()
+  #Función 1
+  if ((class(bestA_o16)==class(errores_2))==F) {
+  errores_medios = array( dim = d)
+    for (i in 1:20) {
+        for (j in 1:17) {
+            errores_medios[1,j,i] = mean(errores_1[,,j,i])
+        }
+        list_bestA[i]= which(errores_medios[,,i] == min(errores_medios[,,i]), arr.ind = TRUE)
+    }
+  return(list_bestA)
+  #Función 2
+  } else{
+      errores_medios_1 = array( dim = d)
+      errores_medios_2 = array( dim = d)
+      best_model =array()
+      for (i in 1:20) {
+        for (j in 1:17) {
+          errores_medios_1[1,j,i] = mean(errores_1[,,j,i])
+          errores_medios_2[1,j,i] = mean(errores_2[,,j,i])
+        }
+        if (min(a[,,i])>min(b[,,i])) {
+          list_bestA[i]= which(errores_medios_1[,,i] == min(errores_medios_1[,,i]), arr.ind = TRUE)
+          best_serie[i] = 1
+        } else{
+          list_bestA[i]= which(errores_medios_2[,,i] == min(errores_medios_2[,,i]), arr.ind = TRUE)
+          best_serie[i]=2
+        }
+      }
+      salida = rbind(list_bestA,best_serie)
+      rownames(salida) = c("modelo","serie")
+    return(salida)}
+    
+}
+```
+
